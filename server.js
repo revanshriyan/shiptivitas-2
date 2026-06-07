@@ -1,16 +1,18 @@
-import express from 'express';
-import Database from 'better-sqlite3';
+const express = require('express');
+const sqlite3 = require('sqlite3').verbose();
+const cors = require('cors');
 
 const app = express();
 
+app.use(cors());
 app.use(express.json());
 
 app.get('/', (req, res) => {
   return res.status(200).send({'message': 'SHIPTIVITY API. Read documentation to see API docs'});
 });
 
-// We are keeping one connection alive for the rest of the life application for simplicity
-const db = new Database('./clients.db');
+// Open database connection
+const db = new sqlite3.Database('./clients.db');
 
 // Don't forget to close connection when server gets terminated
 const closeDb = () => db.close();
@@ -28,16 +30,6 @@ const validateId = (id) => {
       messageObj: {
       'message': 'Invalid id provided.',
       'long_message': 'Id can only be integer.',
-      },
-    };
-  }
-  const client = db.prepare('select * from clients where id = ? limit 1').get(id);
-  if (!client) {
-    return {
-      valid: false,
-      messageObj: {
-      'message': 'Invalid id provided.',
-      'long_message': 'Cannot find client with that id.',
       },
     };
   }
@@ -79,12 +71,16 @@ app.get('/api/v1/clients', (req, res) => {
         'long_message': 'Status can only be one of the following: [backlog | in-progress | complete].',
       });
     }
-    const clients = db.prepare('select * from clients where status = ?').all(status);
-    return res.status(200).send(clients);
+    db.all('select * from clients where status = ?', [status], (err, clients) => {
+      if (err) return res.status(500).send(err);
+      return res.status(200).send(clients);
+    });
+  } else {
+    db.all('select * from clients', [], (err, clients) => {
+      if (err) return res.status(500).send(err);
+      return res.status(200).send(clients);
+    });
   }
-  const statement = db.prepare('select * from clients');
-  const clients = statement.all();
-  return res.status(200).send(clients);
 });
 
 /**
@@ -95,9 +91,13 @@ app.get('/api/v1/clients/:id', (req, res) => {
   const id = parseInt(req.params.id , 10);
   const { valid, messageObj } = validateId(id);
   if (!valid) {
-    res.status(400).send(messageObj);
+    return res.status(400).send(messageObj);
   }
-  return res.status(200).send(db.prepare('select * from clients where id = ?').get(id));
+  db.get('select * from clients where id = ?', [id], (err, client) => {
+    if (err) return res.status(500).send(err);
+    if (!client) return res.status(404).send({'message': 'Client not found'});
+    return res.status(200).send(client);
+  });
 });
 
 /**
@@ -116,20 +116,96 @@ app.get('/api/v1/clients/:id', (req, res) => {
  */
 app.put('/api/v1/clients/:id', (req, res) => {
   const id = parseInt(req.params.id , 10);
-  const { valid, messageObj } = validateId(id);
-  if (!valid) {
-    res.status(400).send(messageObj);
+  
+  if (Number.isNaN(id)) {
+    return res.status(400).send({
+      'message': 'Invalid id provided.',
+      'long_message': 'Id can only be integer.',
+    });
   }
 
   let { status, priority } = req.body;
-  let clients = db.prepare('select * from clients').all();
-  const client = clients.find(client => client.id === id);
 
-  /* ---------- Update code below ----------*/
+  // Check if client exists
+  db.get('select * from clients where id = ?', [id], (err, client) => {
+    if (err) return res.status(500).send(err);
+    if (!client) {
+      return res.status(400).send({
+        'message': 'Invalid id provided.',
+        'long_message': 'Cannot find client with that id.',
+      });
+    }
 
+    /* ---------- Update code below ----------*/
 
+    // Update status if provided
+    if (status) {
+      if (status !== 'backlog' && status !== 'in-progress' && status !== 'complete') {
+        return res.status(400).send({
+          'message': 'Invalid status provided.',
+          'long_message': 'Status can only be one of the following: [backlog | in-progress | complete].',
+        });
+      }
+      db.run('update clients set status = ? where id = ?', [status, id]);
+    }
 
-  return res.status(200).send(clients);
+    // Update priority if provided
+    if (priority !== undefined && priority !== null) {
+      if (Number.isNaN(parseInt(priority, 10))) {
+        return res.status(400).send({
+          'message': 'Invalid priority provided.',
+          'long_message': 'Priority can only be positive integer.',
+        });
+      }
+
+      // Get the new status (either updated status or current status)
+      const newStatus = status || client.status;
+
+      // Get all clients in the same status, ordered by priority
+      db.all('select * from clients where status = ? order by priority', [newStatus], (err, statusClients) => {
+        if (err) return res.status(500).send(err);
+
+        // Remove the current client from the list
+        const otherClients = statusClients.filter(c => c.id !== id);
+
+        // Insert the client at the new priority position
+        // Priority 1 = highest (top of swimlane)
+        const newPriority = parseInt(priority, 10);
+
+        // Update priorities of other clients to make room
+        const updatePromises = [];
+        for (let i = 0; i < otherClients.length; i++) {
+          const currentPriority = i + 1;
+          if (i + 1 >= newPriority) {
+            // Shift down clients that are at or after the new position
+            db.run('update clients set priority = ? where id = ?', [currentPriority + 1, otherClients[i].id]);
+          } else {
+            // Keep clients before the new position as-is
+            db.run('update clients set priority = ? where id = ?', [currentPriority, otherClients[i].id]);
+          }
+        }
+
+        // Set the moved client's priority
+        db.run('update clients set priority = ? where id = ?', [newPriority, id], (err) => {
+          if (err) return res.status(500).send(err);
+
+          // Re-fetch all clients to return updated list
+          db.all('select * from clients', [], (err, clients) => {
+            if (err) return res.status(500).send(err);
+            return res.status(200).send(clients);
+          });
+        });
+      });
+    } else {
+      // No priority update, just return all clients
+      db.all('select * from clients', [], (err, clients) => {
+        if (err) return res.status(500).send(err);
+        return res.status(200).send(clients);
+      });
+    }
+
+    /* ---------- Update code above ----------*/
+  });
 });
 
 app.listen(3001);
